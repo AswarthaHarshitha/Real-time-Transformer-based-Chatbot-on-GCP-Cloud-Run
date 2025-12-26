@@ -1,96 +1,150 @@
-This document summarizes deployment options and practical commands to:
-- Export and quantize a Hugging Face causal LM to ONNX and serve on Cloud Run (CPU path)
-- Deploy a GPU-backed inference endpoint using Vertex AI (recommended for sub-200ms latency)
+## 🚀 Deployment Guide — ONNX (CPU) and Vertex AI (GPU)
 
-Prerequisites
-- gcloud CLI configured and authenticated
+This project supports two deployment paths:
+- Cloud Run (CPU) using ONNX + quantization
+- Vertex AI (GPU) for low-latency production (recommended)
+
+-------------------------------------
+✅ Prerequisites
+-------------------------------------
+- Python 3.8+
 - Docker installed
-- Python 3.8+ for export/quantize steps
+- Google Cloud gcloud CLI installed and authenticated
 
-1) Artifact Registry + Cloud Run (quick setup)
+Run:
 
-Enable required APIs:
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
 
-```bash
+-------------------------------------
+1️⃣ Quick Deployment — Artifact Registry + Cloud Run
+-------------------------------------
+
+Enable APIs:
+
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com
-```
 
-Create an Artifact Registry (one-time):
+Create Artifact Registry:
 
-```bash
-gcloud artifacts repositories create chatbot-repo --repository-format=docker --location=us-central1
-```
+gcloud artifacts repositories create chatbot-repo \
+  --repository-format=docker \
+  --location=us-central1
 
-Build & deploy helper (already in repository):
+Deploy using script:
 
-```bash
-# set env vars then
 ./scripts/deploy.sh
-```
 
-4) After deployment, note the service URL from gcloud output and test /chat endpoint.
+After deployment:
+- copy the Cloud Run URL
+- test the /chat endpoint
 
-2) CPU path: ONNX export + quantization (best-effort to approach <200ms)
+-------------------------------------
+2️⃣ CPU Path — ONNX Export + Quantization
+-------------------------------------
 
-Export an ONNX model suitable for CPU inference. Note: exporting full causal LM with past_key_values requires model-specific graph adjustments.
+This is cost-efficient and suitable for moderate latency workloads.
 
-```bash
-python src/onnx_export_optimized.py --model outputs/distilgpt2-dialogue --out onnx
-```
+Step 1 — Export model to ONNX
 
-This writes `onnx/model.onnx`.
+python src/onnx_export_optimized.py \
+  --model outputs/distilgpt2-dialogue \
+  --out onnx
 
-Quantize the ONNX model to int8 (post-training dynamic quantization):
+Output generated:
+onnx/model.onnx
 
-```bash
-python src/quantize_onnx.py --input onnx/model.onnx --output onnx/model.quant.onnx
-```
+Step 2 — Quantize model to INT8
 
-Serve with ONNX Runtime (CPU-optimized): build the ONNX Docker image and deploy to Cloud Run. Use `--concurrency=1` and `--min-instances=1` to reduce per-request latency.
+python src/quantize_onnx.py \
+  --input onnx/model.onnx \
+  --output onnx/model.quant.onnx
 
-```bash
-# build using Dockerfile.onnx
-docker build -f Dockerfile.onnx -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/chatbot-onnx:latest .
+Step 3 — Build and deploy ONNX container
+
+Build image:
+
+docker build -f Dockerfile.onnx \
+  -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/chatbot-onnx:latest .
+
+Push image:
 
 docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/chatbot-onnx:latest
 
-gcloud run deploy onnx-chatbot --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/chatbot-onnx:latest --platform managed --region ${REGION} --concurrency=1 --min-instances=1 --memory=2Gi --allow-unauthenticated
-```
+Deploy to Cloud Run:
 
-Notes about CPU path and expectations:
-- Quantization + ONNX Runtime can deliver meaningful speedups (2-4x) especially on CPUs with AVX/oneDNN support, but may still be above 200ms for medium-sized models.
-- Use `onnxruntime` builds that enable MKL/oneDNN and OpenMP for maximum throughput.
-- For small models and short responses you stand a better chance of approaching 200ms on high-CPU Cloud Run instances.
+gcloud run deploy onnx-chatbot \
+  --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/chatbot-onnx:latest \
+  --platform managed \
+  --region ${REGION} \
+  --concurrency=1 \
+  --min-instances=1 \
+  --memory=2Gi \
+  --allow-unauthenticated
 
-3) GPU path: Vertex AI (recommended for strict <200ms)
+CPU performance notes:
+- ONNX + INT8 can give 2–4x speedup
+- <200ms depends on small models and short outputs
+- best results when ONNX Runtime uses oneDNN / MKL
 
-Vertex AI provides managed GPUs for inference. Steps summary:
+-------------------------------------
+3️⃣ GPU Path — Vertex AI (Recommended)
+-------------------------------------
 
-1. Upload model to GCS
+Use this when you need:
+- <200ms latency
+- larger models
+- production stability
 
-```bash
+Step 1 — Upload model to Cloud Storage
+
 gsutil cp -r outputs/distilgpt2-dialogue gs://$BUCKET/models/distilgpt2-dialogue
-```
 
-2. Create Vertex AI model resource
+Step 2 — Register model in Vertex AI
 
-```bash
-gcloud ai models upload --region=$REGION --display-name=distilgpt2-dialogue --artifact-uri=gs://$BUCKET/models/distilgpt2-dialogue
-```
+gcloud ai models upload \
+  --region=$REGION \
+  --display-name=distilgpt2-dialogue \
+  --artifact-uri=gs://$BUCKET/models/distilgpt2-dialogue
 
-3. Create endpoint and deploy with GPU
+Step 3 — Create endpoint and deploy to GPU
 
-```bash
-gcloud ai endpoints create --region=$REGION --display-name=chatbot-endpoint
-# Deploy model: replace ENDPOINT_ID and MODEL_ID after create/upload
-gcloud ai endpoints deploy-model ENDPOINT_ID --model=MODEL_ID --region=$REGION --machine-type=n1-standard-8 --accelerator=count=1,type=nvidia-tesla-t4
-```
+Create endpoint:
 
-Notes:
-- Vertex AI gives you GPU-backed inference with optimized runtimes and lower latency; this is the most reliable path for <200ms for non-trivial models.
-- Costs are higher, but latency and throughput are typically far better than CPU-only Cloud Run.
+gcloud ai endpoints create \
+  --region=$REGION \
+  --display-name=chatbot-endpoint
 
-Performance checklist
-- Run `scripts/measure_latency.py` locally against the running service and against the deployed URL.
-- Measure p50/p95 latency and throughput with realistic prompts.
-- Tune: model size, max_new_tokens, quantization, CPU affinity, min-instances, memory/cpu and concurrency.
+Deploy model (replace ENDPOINT_ID and MODEL_ID):
+
+gcloud ai endpoints deploy-model ENDPOINT_ID \
+  --model=MODEL_ID \
+  --region=$REGION \
+  --machine-type=n1-standard-8 \
+  --accelerator=count=1,type=nvidia-tesla-t4
+
+-------------------------------------
+📊 Performance Checklist
+-------------------------------------
+
+Measure latency:
+
+python scripts/measure_latency.py
+
+Test against:
+- local server
+- deployed URL
+
+Tune:
+- model size
+- max_new_tokens
+- quantization level
+- CPU/memory tier
+- number of workers
+- concurrency
+- min-instances warm start
+
+-------------------------------------
+✅ Summary
+-------------------------------------
+Cloud Run + ONNX (CPU): cheaper and simpler, good for prototypes
+Vertex AI (GPU): lowest latency, best for production chat systems
